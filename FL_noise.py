@@ -52,7 +52,7 @@ EPOCHS = 10
 
 dir_img = Path('./data/PNGs/imgs/')
 dir_mask = Path('./data/PNGs/masks/')
-dir_checkpoint = Path('./checkpoints/')
+dir_checkpoint = Path('./checkpoints_noisy/')
 
 images = list(paths.list_images(dir_img))
 masks = [str(dir_mask) + os.path.basename(img_path) for img_path in images]
@@ -60,12 +60,6 @@ masks = [str(dir_mask) + os.path.basename(img_path) for img_path in images]
 torch.manual_seed(42)
 np.random.seed(42)
 cuda = torch.device('cuda:0')
-
-# data_transforms = transforms.Compose([
-#     transforms.Resize((IMG_SIZE, IMG_SIZE)),
-#     transforms.ToTensor(),
-#     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-# ])
 
 # 1. Create dataset
 try:
@@ -76,20 +70,16 @@ except (AssertionError, RuntimeError, IndexError):
 # 2. Split into train / test partitions
 n_train = 198
 n_test = 49
-# train_set, test_set = random_split(dataset, [n_train, n_test], generator=torch.Generator().manual_seed(0))
+train_set, test_set = random_split(dataset, [n_train, n_test], generator=torch.Generator().manual_seed(0))
 
-# Load split used by other models
-train_indices = np.loadtxt('train_indices_run7.txt', dtype=int)
-test_indices = np.loadtxt('test_indices_run7.txt', dtype=int)
-
-train_set = torch.utils.data.Subset(dataset, train_indices)
-test_set = torch.utils.data.Subset(dataset, test_indices)
+# save indices to file
+np.savetxt('train_indices_run7.txt', train_set.indices, fmt="%d")
+np.savetxt('test_indices_run7.txt', test_set.indices, fmt="%d")
 
 # 3. Combine datasets into a single dataset and create data loaders
 loader_args = dict(batch_size=BATCH_SIZE, num_workers=os.cpu_count(), pin_memory=True)
-train_loader = DataLoader(train_set, shuffle=False, **loader_args)
+train_loader = DataLoader(train_set, shuffle=True, **loader_args)
 test_loader = DataLoader(test_set, shuffle=False, drop_last=True, **loader_args)
-
 
 # store test image names (optional)
 test_images = []
@@ -111,27 +101,43 @@ def randomize_clients_data(train_size, num_clients, minimum_size):
     return data_per_client
 
 
-def create_clients(data, num_clients, initial='clients', indices=None):
+def create_clients(data, num_clients, noisy_client=None, noise_type=None, initial='clients'):
+    assert num_clients >= 1
     client_names = ['{}_{}'.format(initial, i+1) for i in range(num_clients)]
-    clients_batch = {}
+    if noisy_client is not None:
+        client_names[noisy_client] = 'evil_client'
+    training_data_size = len(data)
+    minimum_size = training_data_size // num_clients
+    shard_size = randomize_clients_data(training_data_size, num_clients, minimum_size)
     
-    if indices is not None:
-        for i, vals in enumerate(indices):
-            client_idx = [idx for idx, item in enumerate(data) if item['name'] in vals]
-            print(f'client {i} : data size: {len(client_idx)}')
-            clients_batch[client_names[i]] = batch_data(torch.utils.data.Subset(data, client_idx))
-    else:
-        training_data_size = len(data)
-        minimum_size = training_data_size // num_clients
-        shard_size = randomize_clients_data(training_data_size, num_clients, minimum_size)
-        shards = [torch.utils.data.Subset(data, range(i * shard_size[i], (i + 1) * shard_size[i])) for i in range(num_clients)]
-        assert(len(shards) == len(client_names))
-        
-        for i in range(len(shards)):
-            print(f'client {i} : data size: {len(shards[i])}')
+    shards = [torch.utils.data.Subset(data, range(i * shard_size[i], (i + 1) * shard_size[i])) for i in range(num_clients)]
+    
+    clients_batch = {}
+    for i in range(len(shards)):
+        print(f'client {i} : data size: {len(shards[i])}')
+        if i == noisy_client:
+            noisy_images = []
+            for idx in range(len(shards[i])):
+                sample = shards[i].dataset[idx]
+                image = sample['image']
+                mask = sample['mask']
+                name = sample['name']
+                
+                # add gaussian blur
+                if noise_type == 'gaussian':
+                    noisy_image = gaussian_noise(image)
+                    
+                # add salt and pepper noise
+                else:
+                    noisy_image = sp_noise(image)
+                    
+                noisy_images.append({'image': noisy_image, 'mask': mask, 'name': name})
+                
+            clients_batch[client_names[i]] = batch_data(noisy_images)
+        else:
             clients_batch[client_names[i]] = batch_data(shards[i])
     
-    
+    assert(len(shards) == len(client_names))
     return clients_batch
 
 
@@ -161,41 +167,65 @@ def server_aggregate(global_model, client_models):
     
     return global_model
 
+"""
+Noise addition
+Use same image, client and noise distribution for:
+    * Main model (clean, no noise)
+    * Salt and pepper noise
+    * Gaussian blur
+    * Attention maps
+Compare results between models
+    * 1 malicious client
+"""
 
-# FL model training
+def sp_noise(image, salt=0.02, pepper=0.02):
+    noisy = image.clone()
+    salt_pix = (torch.rand_like(image) < salt)
+    pepper_pix = (torch.rand_like(image) < pepper)
+    
+    noisy = noisy + salt_pix.float() * 0.0
+    noisy = noisy - pepper_pix.float() * 255.0
+    
+    return noisy
+
+def gaussian_noise(image, mean=0, std=0.001):
+    noisy = image.clone()
+    noisy = noisy + (torch.randn_like(image) * std + mean)
+    
+    return noisy
+
+
 def train_model_federated(
         global_model,
         device,
         clients_batched,
         epochs: int = EPOCHS,
-        batch_size: int = 1,
+        batch_size: int = BATCH_SIZE,
         learning_rate: float = 1e-5,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
-        amp: bool = True,
+        amp: bool = False,
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
 ):
     
-    
-    experiment = wandb.init(project='Fed-U-Net', resume='allow', anonymous='must')
+    experiment = wandb.init(project='Noise_Model', resume='allow')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
+             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp, noise_type='gaussian blur', evil_client='1/3')
     )
 
     logging.info(f'''Starting federated training:
         Epochs:          {epochs}
         Batch size:      {batch_size}
         Learning rate:   {learning_rate}
-        Training size:   {n_train}
-        Test size:       {n_test}
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
         Images scaling:  {img_scale}
         Mixed Precision: {amp}
+        Noise type:      gaussian blur
     ''')
     
     wandb.log({"test images": test_images})
@@ -224,7 +254,7 @@ def train_model_federated(
 
                 # client_loader = DataLoader(client_data, batch_size=BATCH_SIZE, shuffle=False)
                 for i, batch in enumerate(client_loader):
-                    print("Batch", i + 1, "out of", len(client_loader))
+                    print(f"Batch {i+1}/{len(client_loader)}")
                     images, true_masks, name = batch['image'], batch['mask'], batch['name']       
                     images_list.append(name)                    
 
@@ -276,7 +306,10 @@ def train_model_federated(
                             wandb.Image(mask_pil, caption=f"mask: {name[0]}"),
                             wandb.Image(preds_pil, caption=f"pred: {name[0]}")
                         ])
-                        
+                
+                        if 'evil_client' in client_name and epoch == 1:
+                            os.makedirs('./perturbations/gb/run7', exist_ok=True)
+                            image_pil.save(f'./perturbations/gb/run7/{name[0]}_epoch{epoch}.png')
                 
                 pbar.update(1)
                 pbar.set_postfix(**{'loss (client)': epoch_loss})
@@ -296,7 +329,7 @@ def train_model_federated(
         try:
             experiment.log({
                 'Learning rate': optimizer.param_groups[0]['lr'],
-                f'Test Dice epoch {epoch}': test_score,
+                'Test Dice': test_score,
                 'Epoch': epoch
             })
         except:
@@ -324,6 +357,7 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--noise-type', type=str, choices=['salt_and_pepper', 'gaussian'], default='gaussian', help='Noise type during training')
 
     return parser.parse_args()
 
@@ -352,20 +386,23 @@ if __name__ == '__main__':
         model.load_state_dict(state_dict)
         logging.info(f'Model loaded from {args.load}')
 
-    client_data = np.load('client_split_run7.npy', allow_pickle=True)
-    clients_batch = create_clients(train_set, num_clients=3, indices=client_data)
+    clients_batch = create_clients(train_set, num_clients=3, noisy_client=0)    
     images_set = {}
+    images_array = []
     
     for key, value in clients_batch.items():
         client_img = []
         for batch in value:
-            client_img.append(batch['name'])
+            client_img.append(batch['name'][0])
         images_set[key] = client_img
+        images_array.append(client_img)
+        
     
     print("Training images per client:\n", images_set)
+    np.save('client_split_run7.npy', images_array)
+    
     model.to(device=device)
-    
-    
+        
     try:
         train_model_federated(
             global_model=model,
@@ -398,7 +435,7 @@ if __name__ == '__main__':
         )
     
     try:
-        torch.save(model.state_dict(), './models/FL_segmentation_run7.pth')
+        torch.save(model.state_dict(), f'./models/FL_seg_gb_run7.pth')
     except:
         print("Could not save model to file.")
 
