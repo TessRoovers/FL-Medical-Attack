@@ -26,6 +26,15 @@ pip install -r requirements.txt
 ```
 
 ### Usage
+Place your images and corresponding segmentation masks as PNG files in the following folders:
+```markdown
+- data
+  - imgs
+  - masks
+```
+Due to file size limitations, the data set used in this project is only available in zipped folder format (data.zip).
+
+
 Run the main script using the following parameters:
 ```bash
 python3 ./train_gc.py --probability --std --label
