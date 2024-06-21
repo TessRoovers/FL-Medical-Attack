@@ -2,7 +2,7 @@
 
 ## Overview
 This repository contains the code and documentation for my bachelor thesis on adversarial attacks on medical image segmentation in federated learning.
-More information can be found in the file *thesis.pdf*.
+More information can be found in the file *Thesis.pdf*.
 
 ## Abstract
 In this study, the impact of adversarial attacks on medical image segmentation in federated learning was researched. 
