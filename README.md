@@ -26,12 +26,20 @@ pip install -r requirements.txt
 ```
 
 ### Usage
-Place your images and corresponding segmentation masks as PNG files in the following folders:
+Place your images and corresponding segmentation masks as PNG files (with the same file name) in the following folders:
 ```markdown
 - data
   - imgs
+    - image1.png
+    - image2.png
+    ...
+
   - masks
+    - image1.png
+    - image2.png
+    ...
 ```
+
 Due to file size limitations, the data set used in this project is only available in zipped folder format (data.zip).
 
 
